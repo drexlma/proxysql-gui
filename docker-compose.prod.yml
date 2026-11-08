@@ -1,0 +1,116 @@
+# ProxySQL-GUI – Produktion
+#
+#   cp .env.prod.example .env.prod          # Werte eintragen
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+#
+# Standard: nur die GUI, gegen ein bestehendes ProxySQL und Backend. Zusätzlich über COMPOSE_PROFILES:
+#   sync      automatischer Abgleich laut AUTO_SYNC (Konten, Cluster-Knoten)
+#   proxysql  ProxySQL selbst mitbetreiben (erste Konfiguration aus docker/proxysql/proxysql.prod.cnf.tpl)
+#
+# Die GUI lauscht nur auf 127.0.0.1 – davor gehört ein Reverse-Proxy mit HTTPS.
+# Pflichtwerte ohne Standard (Passwörter) fehlen absichtlich: ohne sie startet nichts.
+
+name: proxysql-gui-prod
+
+# Logs an Syslog: standardmäßig der des Hosts (/dev/log – rsyslog oder journald), mit SYSLOG_ADDRESS ein
+# zentraler Server, z. B. tcp://logs.example.com:514. docker compose logs funktioniert über den Zwischenspeicher
+# von Docker weiter. Docker Desktop (macOS/Windows) hat keinen lokalen Syslog – dort SYSLOG_ADDRESS setzen.
+x-logging: &logging
+  driver: syslog
+  options:
+    syslog-address: ${SYSLOG_ADDRESS:-unixgram:///dev/log}
+    tag: "{{.ImageName}}/{{.Name}}/{{.ID}}"
+
+# Code steckt im Image (kein Live-Mount wie im Test-Setup); Dateisystem schreibgeschützt
+x-gui: &gui
+  build:
+    context: .
+    dockerfile: docker/gui/Dockerfile
+  image: proxysql-gui:${GUI_IMAGE_TAG:-latest}
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp
+    - /run
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+  logging: *logging
+  depends_on:
+    proxysql:
+      condition: service_healthy
+      required: false
+  environment:
+    TZ: ${TZ:-Europe/Berlin}
+    PROXYSQL_HOST: ${PROXYSQL_HOST:?PROXYSQL_HOST fehlt - mit Profil proxysql ist es proxysql}
+    PROXYSQL_PORT: ${PROXYSQL_PORT:-6032}
+    PROXYSQL_USER: ${PROXYSQL_USER:-radmin}
+    PROXYSQL_PASSWORD: ${PROXYSQL_PASSWORD:?PROXYSQL_PASSWORD fehlt}
+    BACKEND_HOST: ${BACKEND_HOST:-}
+    BACKEND_PORT: ${BACKEND_PORT:-3306}
+    BACKEND_USER: ${BACKEND_USER:-}
+    BACKEND_PASSWORD: ${BACKEND_PASSWORD:-}
+    GUI_USER: ${GUI_USER:-admin}
+    GUI_PASSWORD: ${GUI_PASSWORD:?GUI_PASSWORD fehlt}
+    GUI_READONLY: ${GUI_READONLY:-0}
+    GUI_READONLY_USER: ${GUI_READONLY_USER:-readonly}
+    GUI_READONLY_PASSWORD: ${GUI_READONLY_PASSWORD:-}
+    SAVE_TO_DISK: ${SAVE_TO_DISK:-1}
+    IGNORE_USERS: ${IGNORE_USERS:-}
+    AUTO_SYNC: ${AUTO_SYNC:-}
+    SYNC_INTERVAL: ${SYNC_INTERVAL:-60}
+    SYNC_HOSTGROUP: ${SYNC_HOSTGROUP:-}
+
+services:
+  gui:
+    <<: *gui
+    # Apache: Port 80 binden und auf www-data wechseln
+    cap_add: [NET_BIND_SERVICE, SETUID, SETGID]
+    ports:
+      - "${GUI_BIND:-127.0.0.1}:${GUI_PORT:-8080}:80"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost/?page=login"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  sync:
+    <<: *gui
+    profiles: ["sync"]
+    user: www-data
+    entrypoint: ["/bin/sh", "-c", "while true; do php /var/www/html/bin/sync.php; sleep \"$${SYNC_INTERVAL:-60}\"; done"]
+
+  proxysql:
+    image: proxysql/proxysql:3.0
+    profiles: ["proxysql"]
+    restart: unless-stopped
+    logging: *logging
+    entrypoint: ["/bin/bash", "/docker/entrypoint.sh"]
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+      PROXYSQL_CNF_TEMPLATE: /docker/proxysql.prod.cnf.tpl
+      # dasselbe Passwort, mit dem sich die GUI anmeldet
+      PROXYSQL_ADMIN_PASSWORD: ${PROXYSQL_PASSWORD:?PROXYSQL_PASSWORD fehlt}
+      MONITOR_USER: ${MONITOR_USER:-monitor}
+      MONITOR_PASSWORD: ${MONITOR_PASSWORD:-}
+      BACKEND_HOST: ${BACKEND_HOST:-}
+      BACKEND_PORT: ${BACKEND_PORT:-3306}
+      MYSQL_SERVER_VERSION: ${MYSQL_SERVER_VERSION:-8.0.36}
+    volumes:
+      - ./docker/proxysql:/docker:ro
+      - proxysql-data:/var/lib/proxysql
+    # Anwendungen verbinden sich hier; das Admin-Interface (6032) bleibt im Compose-Netz
+    ports:
+      - "${PROXYSQL_BIND:-0.0.0.0}:${PROXYSQL_APP_PORT:-6033}:6033"
+    ulimits:
+      nofile:
+        soft: 102400
+        hard: 102400
+    healthcheck:
+      test: ["CMD-SHELL", "mysql -h127.0.0.1 -P6032 -uradmin -p\"$$PROXYSQL_ADMIN_PASSWORD\" -e 'SELECT 1' >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  proxysql-data:

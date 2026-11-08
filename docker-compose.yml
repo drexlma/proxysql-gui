@@ -1,0 +1,164 @@
+# ProxySQL + MariaDB (mit Replikat) + ProxySQL-GUI – Test- und Demo-Umgebung
+#
+# Nicht für den Produktivbetrieb: Demo-Passwörter, Testdatenbank, Lastgenerator und absichtlich
+# eingebaute Probleme. Für Produktion: docker-compose.prod.yml mit .env.prod (siehe README).
+#
+#   cp .env.example .env        # Passwörter anpassen (optional)
+#   docker compose up -d --build
+#
+#   GUI:      http://localhost:8080   (Login: GUI_USER / GUI_PASSWORD, nur lesen: GUI_READONLY_USER / GUI_READONLY_PASSWORD)
+#   Apps:     localhost:6033          (MySQL-Protokoll über ProxySQL)
+#   Admin:    127.0.0.1:6032          (ProxySQL-Admin, nur lokal)
+#
+# Automatischer Abgleich (Konten, Cluster-Knoten): AUTO_SYNC setzen und mit Profil "sync" starten,
+#   z. B. in der .env: AUTO_SYNC=users,passwords,cluster und COMPOSE_PROFILES=sync
+
+name: proxysql-gui
+
+# Einstellungen für GUI und Sync-Container
+x-gui-env: &gui-env
+  TZ: ${TZ:-Europe/Berlin}
+  PROXYSQL_HOST: proxysql
+  PROXYSQL_PORT: 6032
+  PROXYSQL_USER: radmin
+  PROXYSQL_PASSWORD: ${PROXYSQL_ADMIN_PASSWORD:-radmin-demo}
+  BACKEND_HOST: mariadb
+  BACKEND_PORT: 3306
+  BACKEND_USER: gui_admin
+  BACKEND_PASSWORD: ${GUI_BACKEND_PASSWORD:-gui-demo}
+  GUI_USER: ${GUI_USER:-admin}
+  GUI_PASSWORD: ${GUI_PASSWORD:-admin-demo}
+  GUI_READONLY: ${GUI_READONLY:-0}
+  GUI_READONLY_USER: ${GUI_READONLY_USER:-readonly}
+  GUI_READONLY_PASSWORD: ${GUI_READONLY_PASSWORD:-readonly-demo}
+  AUTO_SYNC: ${AUTO_SYNC:-}
+  SYNC_INTERVAL: ${SYNC_INTERVAL:-60}
+
+x-mariadb-env: &mariadb-env
+  TZ: ${TZ:-Europe/Berlin}
+  MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:-root-demo}
+  MARIADB_DATABASE: shop
+  MARIADB_REPLICATION_USER: repl
+  MARIADB_REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-repl-demo}
+  # werden von docker/mariadb/init/02-accounts.sh verwendet
+  MONITOR_PASSWORD: ${MONITOR_PASSWORD:-monitor-demo}
+  GUI_BACKEND_PASSWORD: ${GUI_BACKEND_PASSWORD:-gui-demo}
+  APP_PASSWORD: ${APP_PASSWORD:-app-demo}
+
+services:
+  mariadb:
+    image: mariadb:11.4
+    restart: unless-stopped
+    # Binlog für das Replikat
+    command: ["--server-id=1", "--log-bin", "--log-basename=primary"]
+    environment: *mariadb-env
+    volumes:
+      - mariadb-data:/var/lib/mysql
+      - ./docker/mariadb/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:${MARIADB_PORT:-3307}:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # Schreibgeschütztes Replikat. Steht absichtlich noch nicht in ProxySQL –
+  # die GUI findet es über die Cluster-Erkennung (Server → Cluster).
+  # Keine eigenen Init-Skripte: Datenbank und Konten kommen per Replikation vom Primary.
+  mariadb-replica:
+    image: mariadb:11.4
+    restart: unless-stopped
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    command: ["--server-id=2", "--log-basename=replica", "--read-only=1", "--report-host=mariadb-replica"]
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:-root-demo}
+      MARIADB_MASTER_HOST: mariadb
+      MARIADB_REPLICATION_USER: repl
+      MARIADB_REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-repl-demo}
+    volumes:
+      - mariadb-replica-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  proxysql:
+    image: proxysql/proxysql:3.0
+    restart: unless-stopped
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+      PROXYSQL_ADMIN_PASSWORD: ${PROXYSQL_ADMIN_PASSWORD:-radmin-demo}
+      MONITOR_PASSWORD: ${MONITOR_PASSWORD:-monitor-demo}
+      APP_PASSWORD: ${APP_PASSWORD:-app-demo}
+    # rendert proxysql.cnf aus dem Template und startet ProxySQL
+    entrypoint: ["/bin/bash", "/docker/entrypoint.sh"]
+    volumes:
+      - ./docker/proxysql:/docker:ro
+      - proxysql-data:/var/lib/proxysql
+    ports:
+      - "${PROXYSQL_PORT:-6033}:6033"
+      - "127.0.0.1:${PROXYSQL_ADMIN_PORT:-6032}:6032"
+    healthcheck:
+      test: ["CMD", "mysql", "-h127.0.0.1", "-P6032", "-uadmin", "-padmin", "-e", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  gui:
+    build:
+      context: .
+      dockerfile: docker/gui/Dockerfile
+    image: proxysql-gui:local
+    restart: unless-stopped
+    depends_on:
+      proxysql:
+        condition: service_healthy
+    environment: *gui-env
+    volumes:
+      # Quellcode live einbinden – Änderungen ohne Rebuild sichtbar
+      - ./src:/var/www/html:ro
+    ports:
+      - "${GUI_PORT:-8080}:80"
+
+  # Automatischer Abgleich laut AUTO_SYNC, alle SYNC_INTERVAL Sekunden (nur mit Profil "sync")
+  sync:
+    build:
+      context: .
+      dockerfile: docker/gui/Dockerfile
+    image: proxysql-gui:local
+    profiles: ["sync"]
+    restart: unless-stopped
+    depends_on:
+      proxysql:
+        condition: service_healthy
+    environment: *gui-env
+    entrypoint: ["/bin/sh", "-c", "while true; do php /var/www/html/bin/sync.php; sleep \"$${SYNC_INTERVAL:-60}\"; done"]
+    volumes:
+      - ./src:/var/www/html:ro
+
+  # Erzeugt etwas Last über ProxySQL, damit Diagramme und Query-Digests Daten zeigen.
+  # Abschalten: docker compose stop loadgen
+  loadgen:
+    image: mariadb:11.4
+    restart: unless-stopped
+    depends_on:
+      proxysql:
+        condition: service_healthy
+    environment:
+      APP_PASSWORD: ${APP_PASSWORD:-app-demo}
+    entrypoint: ["/bin/bash", "/loadgen.sh"]
+    volumes:
+      - ./docker/loadgen/loadgen.sh:/loadgen.sh:ro
+
+volumes:
+  mariadb-data:
+  mariadb-replica-data:
+  proxysql-data:
