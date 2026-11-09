@@ -98,12 +98,10 @@ function layer_rows(string $spec, string $layer, bool $vsRuntime): ?array
         $key = ['username'];
         $drop = ['frontend', 'backend'];
     }
+    $managed = [];
     if ($table === 'mysql_servers' && $vsRuntime) {
-        // Status und Server in Replikations-/Galera-Hostgroups setzt ProxySQL selbst
-        $drop[] = 'status';
-        if ($managed = managed_hostgroups()) {
-            $where = ' WHERE hostgroup_id NOT IN (' . implode(',', $managed) . ')';
-        }
+        $drop[] = 'status'; // setzt ProxySQL selbst (SHUNNED usw.)
+        $managed = managed_hostgroups();
     }
     try {
         $res = q(admin(), "SELECT * FROM $src$where");
@@ -111,6 +109,7 @@ function layer_rows(string $spec, string $layer, bool $vsRuntime): ?array
         return $cache[$ck] = null;
     }
     $rows = [];
+    $grouped = [];
     foreach ($res as $r) {
         $r = array_diff_key($r, array_flip($drop));
         if ($table === 'mysql_users') {
@@ -119,7 +118,22 @@ function layer_rows(string $spec, string $layer, bool $vsRuntime): ?array
         if ($table === 'mysql_query_rules' && $r['digest'] !== null) {
             $r['digest'] = digest_norm($r['digest']);
         }
+        if ($managed && in_array((int) $r['hostgroup_id'], $managed, true)) {
+            $grouped[$r['hostname'] . ':' . $r['port']][] = $r;
+            continue;
+        }
         $rows[json_encode(array_intersect_key($r, array_flip($key)))] = $r;
+    }
+    // In Replikations-/Galera-Hostgroups verschiebt und kopiert ProxySQL Server selbst zwischen den Hostgroups:
+    // dort je Host:Port vergleichen, ohne Hostgroup, mehrere Einträge spaltenweise zusammengefasst
+    foreach ($grouped as $list) {
+        $row = ['hostgroup_id' => 'Cluster'];
+        foreach (array_keys(array_diff_key($list[0], ['hostgroup_id' => 1])) as $c) {
+            $vals = array_unique(array_map(fn ($x) => (string) $x[$c], $list));
+            sort($vals);
+            $row[$c] = implode(' | ', $vals);
+        }
+        $rows[json_encode(array_intersect_key($row, array_flip($key)))] = $row;
     }
     return $cache[$ck] = $rows;
 }

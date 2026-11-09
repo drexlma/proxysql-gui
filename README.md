@@ -1,5 +1,7 @@
 # proxysql-gui
 
+[![CI](https://github.com/drexlma/proxysql-gui/actions/workflows/ci.yml/badge.svg)](https://github.com/drexlma/proxysql-gui/actions/workflows/ci.yml)
+
 Web-Oberfläche für [ProxySQL](https://proxysql.com/) im Stil klassischer Enterprise-Management-Konsolen –
 mit Schreibzugriff, Abgleich von Konten und Cluster-Knoten zwischen ProxySQL und MariaDB/MySQL
 (per Klick oder automatisch) und Query-Cache per Klick.
@@ -11,7 +13,7 @@ gezeichnetes SVG) – läuft also auch in abgeschotteten Netzen.
 
 **Inhalt:** [Schnellstart](#schnellstart-mit-docker-test-umgebung) · [Produktion](#produktivbetrieb-mit-docker) · [Funktionen](#funktionen) · [Automatischer Abgleich](#automatischer-abgleich) ·
 [Demo durchspielen](#demo-durchspielen) · [Konfiguration](#konfiguration) · [Ohne Docker](#ohne-docker) · [Sicherheit](#sicherheit) ·
-[Grenzen](#grenzen) · [Aufbau](#aufbau)
+[Grenzen](#grenzen) · [Tests](#tests) · [Aufbau](#aufbau)
 
 ## Schnellstart mit Docker (Test-Umgebung)
 
@@ -309,9 +311,32 @@ Die GUI hat Schreibrechte auf ProxySQL und – mit dem Backend-Benutzer – fakt
   ohne `report_host` auf dem Replikat kennt die GUI nur die IP und nimmt den Port des Primary an.
 - Nur MySQL-Protokoll; von den PostgreSQL-Funktionen von ProxySQL 3 sind nur die `pgsql-`-Variablen abgedeckt.
 
+## Tests
+
+GitHub Actions (`.github/workflows/ci.yml`) prüft jeden Push auf `main` und jeden Pull Request:
+
+- PHP-Syntax mit PHP 8.1 und 8.4, ShellCheck, JavaScript-Syntax und beide Compose-Dateien
+  (Prod muss ohne Pflichtwerte abbrechen).
+- `tests/e2e.sh` startet den Test-Stack und spielt die Demo durch: Logins und Rollen, alle Seiten, gesperrte Pfade,
+  Vorfälle, Konfigurationsabgleich, Tabellen, Konten-Abgleich mit echter Anmeldung über ProxySQL, Cluster-Aufnahme,
+  Query-Cache, `bin/sync.php` und keine PHP-Warnungen im Log.
+- `tests/prod.sh` startet die GUI aus `docker-compose.prod.yml` gegen den Test-Stack: Healthcheck, schreibgeschütztes
+  Dateisystem, Syslog, Login, Secure-Cookie hinter HTTPS.
+
+Lokal:
+
+```sh
+docker compose up -d --build --wait
+tests/e2e.sh && tests/prod.sh       # GUI auf anderem Port: GUI_PORT=8091 tests/e2e.sh
+docker compose down -v              # der Test verändert den Demo-Zustand
+```
+
 ## Aufbau
 
 ```
+RELEASE-NOTES.md          Änderungen je Version
+.github/workflows/ci.yml  Tests in GitHub Actions
+tests/                    e2e.sh (Test-Stack), prod.sh (Prod-GUI)
 docker-compose.yml        Test-/Demo-Stack (.env.example)
 docker-compose.prod.yml   Produktion (.env.prod.example)
 docker/                   MariaDB-Init, ProxySQL-Templates (Test, Prod) und Entrypoint, GUI-Image, Lastgenerator

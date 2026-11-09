@@ -1,0 +1,5 @@
+# Nur für tests/prod.sh: die Prod-GUI ins Netz des laufenden Test-Stacks hängen
+networks:
+  default:
+    name: proxysql-gui_default
+    external: true

@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  php-lint:
+    name: PHP-Syntax (PHP ${{ matrix.php }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        php: ["8.1", "8.4"] # 8.1 ist die Mindestversion
+    steps:
+      - uses: actions/checkout@v4
+      - name: php -l für alle Dateien
+        run: |
+          docker run --rm -v "$PWD/src:/src:ro" php:${{ matrix.php }}-cli \
+            sh -c 'find /src -name "*.php" -print0 | xargs -0 -n1 php -l'
+
+  checks:
+    name: Skripte und Compose-Dateien
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: shellcheck docker/proxysql/entrypoint.sh docker/mariadb/init/*.sh docker/loadgen/*.sh tests/*.sh
+      - name: JavaScript-Syntax
+        run: node --check src/assets/app.js
+      - name: Compose Test
+        run: docker compose config --quiet
+      - name: Compose Prod
+        run: docker compose -f docker-compose.prod.yml --env-file tests/prod-ci.env config --quiet
+      - name: Prod bricht ohne Pflichtwerte ab
+        run: |
+          if docker compose -f docker-compose.prod.yml --env-file /dev/null config --quiet 2>/dev/null; then
+            echo "docker-compose.prod.yml startet ohne GUI_PASSWORD/PROXYSQL_PASSWORD – das darf nicht sein" >&2
+            exit 1
+          fi
+
+  e2e:
+    name: End-to-End (Test-Stack und Prod-GUI)
+    needs: [php-lint, checks]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test-Stack starten
+        run: docker compose up -d --build --wait
+      - name: tests/e2e.sh
+        run: tests/e2e.sh
+      - name: tests/prod.sh
+        run: tests/prod.sh
+      - name: Logs bei Fehlern
+        if: failure()
+        run: docker compose logs --no-color --tail 200
+      - name: Aufräumen
+        if: always()
+        run: docker compose down -v

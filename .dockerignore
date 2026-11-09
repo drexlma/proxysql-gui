@@ -1,0 +1,7 @@
+.git
+.env
+.env.*
+*.png
+docker/mariadb
+docker/proxysql
+docker/loadgen
